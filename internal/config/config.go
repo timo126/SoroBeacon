@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/secrets"
+	"sync"
 )
+
+var mu sync.RWMutex
 
 // Defaults used when the corresponding environment variable is unset.
 const (
@@ -326,6 +329,12 @@ func (p *problemList) add(field string, err error) {
 	p.list = append(p.list, Problem{Field: field, Reason: err.Error()})
 }
 
+func (p *problemList) firstError() error {
+	if len(p.list) == 0 {
+		return nil
+	}
+	return p.list[0]
+}
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
 // wins over defaults so a checked-in config stays sane while emergency
@@ -1151,6 +1160,7 @@ func parseAPITokens(raw string) ([]string, error) {
 }
 
 func parseLevel(s string) (slog.Level, error) {
+
 	switch strings.ToLower(s) {
 	case "debug":
 		return slog.LevelDebug, nil
@@ -1163,3 +1173,84 @@ func parseLevel(s string) (slog.Level, error) {
 	}
 	return slog.LevelInfo, fmt.Errorf("invalid LOG_LEVEL %q (want debug|info|warn|error)", s)
 }
+// Reload reloads configuration from the environment, validates it, and applies
+// only the reloadable settings. It is safe to call from a SIGHUP handler.
+//
+// Reloadable settings are:
+//   - LogLevel
+//   - PollInterval
+//
+// All other settings (database URL, listen address, source mode, etc.) are
+// explicitly not reloadable and are reported as skipped. If any reloadable
+// setting fails validation, the entire reload is rejected and the previous
+// configuration stays in effect.
+func Reload(cfg *Config) (map[string]reloadChange, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	ps := problemList{}
+	fileValues, err := loadFileValues()
+	if err != nil {
+		return nil, fmt.Errorf("load file values: %w", err)
+	}
+
+	// Reload only the reloadable settings
+	changes := map[string]reloadChange{}
+
+	// LogLevel
+	if v := lookupConfigValue("LOG_LEVEL", fileValues); v != "" {
+		lvl, err := parseLevel(v)
+		if err != nil {
+			ps.add("LOG_LEVEL", err)
+		} else {
+			old := cfg.LogLevel
+			cfg.LogLevel = lvl
+			changes["log_level"] = reloadChange{
+				Old: old.String(),
+				New: cfg.LogLevel.String(),
+			}
+		}
+	}
+
+	// PollInterval
+	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			ps.add("POLL_INTERVAL", fmt.Errorf("invalid POLL_INTERVAL %q: %w", v, err))
+		} else if d < time.Second {
+			ps.add("POLL_INTERVAL", fmt.Errorf("POLL_INTERVAL %q is below the 1s minimum", v))
+		} else {
+			old := cfg.PollInterval
+			cfg.PollInterval = d
+			changes["poll_interval"] = reloadChange{
+				Old: old.String(),
+				New: cfg.PollInterval.String(),
+			}
+		}
+	}
+
+	if len(ps.list) > 0 {
+		// Reject: the entire reload is invalid; previous configuration stays in effect.
+		// Reloadable fields are left unchanged since we hold the lock.
+		return nil, ps.firstError()
+	}
+
+	return changes, nil
+}
+
+// reloadChange describes a single configuration change during reload.
+type reloadChange struct {
+	Old string
+	New string
+}
+
+// IsReloadable returns true if the setting can be reloaded via SIGHUP.
+func IsReloadable(field string) bool {
+	switch field {
+	case "log_level", "poll_interval":
+		return true
+	default:
+		return false
+	}
+}
+

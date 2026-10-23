@@ -1310,3 +1310,113 @@ func TestLoadRejectsBadSecretsConfig(t *testing.T) {
 		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
 	}
 }
+
+// TestReloadAssertsApplied asserts that valid SIGHUP reload applies changes.
+// It sets env vars for reloadable settings and verifies they are applied.
+func TestReloadAssertsApplied(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Start with default config
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("POLL_INTERVAL", "10s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	// Apply reload - both should be accepted
+	changes, err := Reload(&cfg)
+	require.NoError(t, err)
+	require.NotEmpty(t, changes)
+	require.Contains(t, changes, "log_level")
+	require.Contains(t, changes, "poll_interval")
+
+	// Verify the values were applied
+	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+	assert.Equal(t, 10*time.Second, cfg.PollInterval)
+}
+
+// TestReloadAssertsRejected asserts that invalid SIGHUP reload rejects changes
+// and the previous configuration stays in effect.
+func TestReloadAssertsRejected(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Start with default config (valid poll interval)
+	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("POLL_INTERVAL", DefaultPollInterval.String()) // valid default
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	// Now set invalid POLL_INTERVAL for the reload test
+	t.Setenv("POLL_INTERVAL", "100ms")
+
+	// Apply reload - should be rejected due to invalid POLL_INTERVAL
+	changes, err := Reload(&cfg)
+	require.Error(t, err)
+	require.Empty(t, changes) // no changes applied
+
+	// Previous configuration should stay in effect
+	assert.Equal(t, slog.LevelDebug, cfg.LogLevel) // unchanged from what we set
+	assert.Equal(t, DefaultPollInterval, cfg.PollInterval) // unchanged from default
+}
+
+// TestReloadAssertsOnlyReloadableChanged asserts that only reloadable settings
+// are affected; non-reloadable settings (like DATABASE_URL) remain untouched.
+func TestReloadAssertsOnlyReloadableChanged(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Start with default config
+	cfg, err := Load()
+	require.NoError(t, err)
+	originalDB := cfg.DatabaseURL
+
+	// Reload with only LogLevel change
+	t.Setenv("LOG_LEVEL", "warn")
+
+	changes, err := Reload(&cfg)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	require.Contains(t, changes, "log_level")
+
+	// DATABASE_URL should remain unchanged
+	assert.Equal(t, originalDB, cfg.DatabaseURL)
+	assert.Equal(t, slog.LevelWarn, cfg.LogLevel)
+}
+
+// TestReloadAssertsInvalidLogLevelRejected asserts that an invalid LOG_LEVEL
+// causes the entire reload to be rejected.
+func TestReloadAssertsInvalidLogLevelRejected(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	// Reload with invalid LOG_LEVEL
+	t.Setenv("LOG_LEVEL", "not-a-level")
+
+	changes, err := Reload(&cfg)
+	require.Error(t, err)
+	require.Empty(t, changes)
+
+	// Previous config stays in effect
+	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+}
+
+// TestReloadAssertsInvalidPollIntervalRejected asserts that an invalid POLL_INTERVAL
+// (below 1s) causes the entire reload to be rejected.
+func TestReloadAssertsInvalidPollIntervalRejected(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	// Reload with invalid POLL_INTERVAL
+	t.Setenv("POLL_INTERVAL", "500ms")
+
+	changes, err := Reload(&cfg)
+	require.Error(t, err)
+	require.Empty(t, changes)
+
+	// Previous config stays in effect
+	assert.Equal(t, DefaultPollInterval, cfg.PollInterval)
+}
