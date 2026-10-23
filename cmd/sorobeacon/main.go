@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -112,7 +113,7 @@ func run() error {
 	slog.SetDefault(log)
 	log.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogAttrs()...)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	srv, err := newServer(ctx, cfg, log, defaultStartupDeps())
@@ -120,6 +121,29 @@ func run() error {
 		return err
 	}
 	defer srv.Close()
+
+	// SIGHUP handler for reloadable configuration
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+
+	go func() {
+		for range sighup {
+			changes, err := config.Reload(&cfg)
+			if err != nil {
+				slog.Error("configuration reload failed", "err", err)
+				// Previous configuration stays in effect
+				continue
+			}
+			if len(changes) > 0 {
+				changeDescs := make([]string, 0, len(changes))
+				for _, c := range changes {
+					changeDescs = append(changeDescs, fmt.Sprintf("%s -> %s", c.Old, c.New))
+				}
+				slog.Info("configuration reloaded via SIGHUP: " + strings.Join(changeDescs, ", "))
+			}
+		}
+	}()
+
 	return srv.run(ctx)
 }
 
@@ -863,7 +887,7 @@ func runBackfill(args []string) error {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
